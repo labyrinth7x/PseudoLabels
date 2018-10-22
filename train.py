@@ -11,13 +11,15 @@ import os
 import time
 from dataset.mnist import get_dataset
 from torch import optim
-from utils.criterioni import accuracy, joint_loss
+from utils.criterion import accuracy, joint_loss, LogisticLoss
 from utils.AverageMeter import AverageMeter
 from models.lenet import Lenet
 import random
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+T1 = 100
+T2 = 600
 
 def parse_args():
     parser = argparse.ArgumentParser(description='command for train pseudo-labels model')
@@ -30,8 +32,9 @@ def parse_args():
     parser.add_argument('--out', type=str, default='./data/model_data', help='root of the output')
     parser.add_argument('--train_root', type=str, default='./data/img_data/train', help='root of the train dataset')
     parser.add_argument('--test_root', type=str, default='./data/img_data/test', help='root of the test dataset')
-    parser.add_argument('--download', type=float, default=True, help='download dataset')
+    parser.add_argument('--download', type=bool, default=False, help='download dataset')
     parser.add_argument('--seed', type=int, default=None, help='seed for initializing training')
+    parser.add_argument('--num_labeled', type=int, default=3000, help='#labeld samples in training set')
     args = parser.parse_args()
 
     return args
@@ -64,9 +67,8 @@ def network_config(args):
         network = network.cuda(args.gpu)
     else:
         network = nn.DataParallel(network).cuda()
-    print('Total params: %2.fM' % (sum(p.numel()) for p in network.parameters() / 1000000.0))
+    print('Total params: %2.fM' % (sum(p.numel() for p in network.parameters()) / 1000000.0))
 
-    # need to update
     optimizer = optim.SGD(network.parameters(), lr=args.lr, momentum= 0.5)
     cudnn.benchmark = True
 
@@ -110,24 +112,22 @@ def train(train_labeled_loader, train_unlabeled_loader, network, optimizer, epoc
 
     # switch to train mode
     network.train()
-
     # measure data loaading time
     end = time.time()
-
     for i in range(len(train_labeled_loader)):
         img_labeled, labels = next(iter_labeled)
-        img_unlabeled, _ = next(iter_unlabeled)
         img_labeled = img_labeled.cuda(args.gpu, non_blocking=True)
         labels = labels.cuda(args.gpu, non_blocking=True)
-        img_unlabeled = img_unlabeled.cuda(args.gpu, non_blocking=True)
-
         # compute output
         outputs_labeled = network(img_labeled)
-        outputs_unlabeled = network(img_unlabeled)
-        loss = joint_loss(outputs_labeled, outputs_unlabeled, labels, epoch)
-
+        outputs_unlabeled = None
+        if epoch >= T1:
+            img_unlabeled, _ = next(iter_unlabeled)
+            img_unlabeled = img_unlabeled.cuda(args.gpu, non_blocking=True)
+            outputs_unlabeled = network(img_unlabeled)
+        loss = joint_loss(outputs_labeled, outputs_unlabeled, labels, epoch, args.gpu)
         prec1, prec5 = accuracy(outputs_labeled, labels, top=[1,5])
-        train_loss = joint_loss(outputs_labeled, outputs_unlabeled, labels, epoch)
+        train_loss.update(loss, img_labeled.size(0))
         top1.update(prec1, img_labeled.size(0))
         top5.update(prec5, img_labeled.size(0))
 
@@ -139,7 +139,6 @@ def train(train_labeled_loader, train_unlabeled_loader, network, optimizer, epoc
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-
     return train_loss.avg, top5.avg, top1.avg, batch_time.sum
 
 def validate(val_loader, network, criterion):
@@ -178,10 +177,10 @@ def main(args, dst_folder):
     train_labeled_loader, train_unlabeled_loader, val_loader, test_loader = data_config(args)
 
     # criterion
-    val_criterion = nn.BCEWithLogitsLoss()
+    val_criterion = LogisticLoss(args.gpu)
 
     # network config
-    network, optimizer = network_config()
+    network, optimizer = network_config(args)
 
     for epoch in range(args.epoch):
         train_loss, top5_train_ac, top1_train_ac, train_time = train(train_labeled_loader, train_unlabeled_loader, network, optimizer, epoch, args)
